@@ -625,10 +625,14 @@ def _archive_payload(record: dict, reused: bool) -> dict:
     tags=["design-archives"],
 )
 def create_design_archive(request: DesignArchiveIn, response: Response) -> dict:
-    """设计归档：接收 1～50 个已入库设计 ID，**按 ID 升序去重**后在同一读取
-    流程中取出每份设计的参数与审计结果，生成规范化（键字典序、无空白、UTF-8）
-    JSON 清单（`design-archive-v1`），并计算其 SHA-256 摘要持久化。
+    """设计归档：接收 1～50 个已入库设计 ID，**按 ID 升序去重**后在**同一个
+    SQLite 读取快照**（一个只读事务）中取出每份设计的参数与审计结果并完成
+    缺失 ID 判定，生成规范化（键字典序、无空白、UTF-8）JSON 清单
+    （`design-archive-v1`），并计算其 SHA-256 摘要持久化。
 
+    - 批量读取具有快照隔离：即便另一服务实例 / 维护进程在批量读取期间提交了
+      设计、审计的修改或删除，本接口拿到的也始终是某一时刻自洽的整体，
+      **不会把新旧版本拼成从未存在过的清单**；
     - 列表含重复 ID 返回 **400**，不写库；存在未入库 ID 返回 **404**
       （detail 列出全部缺失 ID），不写库——校验、读取全部成功后才执行唯一
       一次写入，**归档失败不产生半成品**；
@@ -669,8 +673,11 @@ def create_design_archive(request: DesignArchiveIn, response: Response) -> dict:
     tags=["design-archives"],
 )
 def verify_design_archive(archive_id: int) -> dict:
-    """归档完整性校验：按归档时记录的设计 ID 列表重新读取**当前**的设计参数
-    与审计结果，重建规范化清单并重算 SHA-256 摘要，与归档摘要比对。
+    """归档完整性校验：按归档时记录的设计 ID 列表，在**同一个 SQLite 读取
+    快照**（与 POST /design-archives 共用 `db.get_designs_many` 的快照语义）
+    中重新读取**当前**的设计参数与审计结果，重建规范化清单并重算 SHA-256
+    摘要，与归档摘要比对。快照隔离保证重算清单自洽：参数、审计与缺失判定
+    来自同一时刻，校验期间的并发提交不会造成新旧拼接的假「不一致」。
 
     - `consistent`：重算摘要与归档摘要一致且无缺失设计项时为 `true`；
     - `missing_design_ids`：归档后被删除（或当前不存在）的设计 ID（升序）；

@@ -340,6 +340,97 @@ def test_verify_detects_drift_first_diff_path():
               "verify is a pure read: repeated reports identical")
 
 
+def test_batch_read_pinned_to_single_sqlite_snapshot():
+    """并发回归：另一连接（模拟另一服务实例 / 维护进程）在批量读取的两条查询
+    之间提交「改设计 + 改审计 + 删设计」时，POST 归档的整批读取必须固定在
+    同一个 SQLite 读取快照上——参数与审计同属旧版本、缺失判定也基于旧快照，
+    绝不拼出新旧混合的清单或误报缺失；GET .../verify 共用同一语义。
+
+    用 WAL 才能在服务端读事务打开期间让写者真正提交（DELETE journal 模式下
+    写者会被阻塞到读事务结束，同样安全但无法演示中途提交）。
+    """
+    with sqlite3.connect(_TMP_DB.name) as conn:
+        mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+    check(mode.lower() == "wal", "test database switched to WAL for the race window")
+
+    try:
+        with TestClient(app) as client:
+            a = _create(client, TWILL)
+            b = _create(client, PLAIN)
+
+            fired = {"count": 0}
+            real_connect = sqlite3.connect
+
+            def maintenance_commit():
+                """模拟维护进程：在批量读取中途提交一揽子修改 / 删除。"""
+                writer = sqlite3.connect(_TMP_DB.name, timeout=10)
+                writer.execute("PRAGMA foreign_keys = ON")
+                writer.execute(
+                    "UPDATE designs SET max_float = 5 WHERE id = ?", (a["id"],)
+                )
+                writer.execute(
+                    "UPDATE audits SET exceeds = 1 WHERE design_id = ?", (a["id"],)
+                )
+                writer.execute("DELETE FROM designs WHERE id = ?", (b["id"],))
+                writer.commit()
+                writer.close()
+                fired["count"] += 1
+
+            def patched_connect(path, *args, **kwargs):
+                conn = real_connect(path, *args, **kwargs)
+                if str(path) == _TMP_DB.name and fired["count"] == 0:
+                    def trace(sql):
+                        # 在批量读取的「审计查询」即将执行时触发：此时设计行已按
+                        # 旧快照读出，审计行与缺失判定若不共享快照就会读到新版本。
+                        if fired["count"] == 0 and " FROM audits" in sql:
+                            maintenance_commit()
+                    conn.set_trace_callback(trace)
+                return conn
+
+            sqlite3.connect = patched_connect
+            try:
+                resp = client.post(
+                    "/design-archives", json={"design_ids": [a["id"], b["id"]]}
+                )
+            finally:
+                sqlite3.connect = real_connect
+
+            check(fired["count"] == 1, "external writer committed during the batch read")
+            check(resp.status_code == 201,
+                  f"snapshot still contains both designs -> 201, got {resp.status_code} "
+                  f"{resp.text}")
+            data = resp.json()
+            check(data["design_ids"] == [a["id"], b["id"]],
+                  "missing-id judgement pinned to the pre-change snapshot (both ids kept)")
+            item_a = next(it for it in data["manifest"]["items"] if it["design_id"] == a["id"])
+            check(item_a["parameters"]["max_float"] == a["max_float"],
+                  "parameters read from the pre-change snapshot (not spliced)")
+            check(item_a["audit"]["exceeds"] == a["audit"]["exceeds"],
+                  "audit row read from the SAME pre-change snapshot (not spliced)")
+            check(len(data["manifest"]["items"]) == 2,
+                  "manifest keeps both items from one coherent snapshot")
+
+            # 外部提交此刻早已落盘：verify 在自己的一个快照内重读当前数据，
+            # 报告必须自洽——a 漂移、b 缺失，首个差异为 design_count（2->1），
+            # 而不是审计 / 参数忽新忽旧造成的假不一致定位。
+            report = client.get(
+                f"/design-archives/{data['id']}/verify"
+            ).json()
+            check(report["consistent"] is False, "verify flags post-snapshot drift")
+            check(report["missing_design_ids"] == [b["id"]],
+                  "verify snapshot sees the deleted design as missing")
+            check(report["first_diff_path"] == "/design_count",
+                  f"verify compares two coherent snapshots, got {report['first_diff_path']!r}")
+            again = client.get(f"/design-archives/{data['id']}/verify").json()
+            check(again["consistent"] == report["consistent"]
+                  and again["first_diff_path"] == report["first_diff_path"],
+                  "verify stays stable on repeat (pure read)")
+    finally:
+        # 还原日志模式，避免给同库后续测试留下 -wal/-shm 状态
+        with sqlite3.connect(_TMP_DB.name) as conn:
+            conn.execute("PRAGMA journal_mode=DELETE")
+
+
 def test_openapi_documents_archive_routes():
     schema = app.openapi()
     paths = schema["paths"]
@@ -366,9 +457,15 @@ if __name__ == "__main__":
     test_verify_fresh_archive_consistent()
     test_verify_detects_deleted_design()
     test_verify_detects_drift_first_diff_path()
+    test_batch_read_pinned_to_single_sqlite_snapshot()
     test_openapi_documents_archive_routes()
     try:
         os.unlink(_TMP_DB.name)
     except OSError:
         pass
+    for suffix in ("-wal", "-shm"):
+        try:
+            os.unlink(_TMP_DB.name + suffix)
+        except OSError:
+            pass
     print("all design-archives API tests passed")

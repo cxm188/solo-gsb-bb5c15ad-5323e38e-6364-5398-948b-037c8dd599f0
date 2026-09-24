@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 
 DB_PATH = os.environ.get("DATABASE_PATH", os.path.join("data", "weave.db"))
 
@@ -80,12 +81,60 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+@contextmanager
+def _db():
+    """获取一条受进程内 `_lock` 保护的连接，with 块结束时**关闭**连接；
+    块内写入正常退出自动 COMMIT、抛异常自动 ROLLBACK。
+
+    注意：`with sqlite3.Connection` 只管事务（提交 / 回滚），**不会关闭
+    连接**，因此不能直接 `with _connect() as conn`——那会让连接随函数
+    返回而泄漏（WAL 模式下残留连接还会阻止日志模式切换）。
+    """
+    with _lock:
+        conn = _connect()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+
+@contextmanager
+def _read_snapshot():
+    """打开一条连接并显式开启一个**只读事务**：with 块内的所有 SELECT 都
+    固定在事务启动瞬间的同一个 SQLite 读取快照上，即使另一进程 / 服务实例
+    （进程内的 `_lock` 无法约束它们）在两条查询之间提交了修改，也不会出现
+    前一条读到旧版本、后一条读到新版本的「拼接」读取。
+
+    SQLite 的事务级快照隔离：显式 `BEGIN` 后首个读语句确定快照（rollback
+    journal 模式下写者会被该读事务阻塞到事务结束；WAL 模式下写者可并行
+    提交但本连接仍只看见旧快照），两种模式下块内读到的内容都严格一致。
+    连接设为 autocommit（`isolation_level=None`），事务边界由这里显式
+    `BEGIN` / 退出时 `COMMIT` 管理，不依赖 sqlite3 模块对 SELECT 不自动
+    开事务的隐式行为。
+    """
+    with _lock:
+        conn = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("BEGIN")
+        try:
+            yield conn
+        except BaseException:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+        finally:
+            conn.close()
+
+
 def init_db() -> None:
     """启动时建表（幂等）。"""
     directory = os.path.dirname(DB_PATH)
     if directory:
         os.makedirs(directory, exist_ok=True)
-    with _lock, _connect() as conn:
+    with _db() as conn:
         conn.executescript(_SCHEMA)
 
 
@@ -103,7 +152,7 @@ def insert_design_with_audit(
     violations: list[dict],
 ) -> int:
     """同事务写入设计与审计结果，返回设计 ID。"""
-    with _lock, _connect() as conn:
+    with _db() as conn:
         cur = conn.execute(
             """INSERT INTO designs
                (name, cyclic, max_float, shafts, treadles, warp_ends, weft_picks,
@@ -159,7 +208,7 @@ def _row_to_detail(design: sqlite3.Row, audit: sqlite3.Row) -> dict:
 
 
 def get_design(design_id: int) -> dict | None:
-    with _lock, _connect() as conn:
+    with _db() as conn:
         design = conn.execute(
             "SELECT * FROM designs WHERE id = ?", (design_id,)
         ).fetchone()
@@ -193,7 +242,7 @@ def _row_to_summary(r: sqlite3.Row) -> dict:
 
 
 def list_designs() -> list[dict]:
-    with _lock, _connect() as conn:
+    with _db() as conn:
         rows = conn.execute(
             f"{_SUMMARY_SELECT} ORDER BY d.id"
         ).fetchall()
@@ -212,7 +261,7 @@ def list_designs_page(*, limit: int, after_id: int | None = None) -> dict:
       之后，绝不会让已返回的项重复出现（设计只新增、ID 单调递增）。
     """
     cursor = after_id if after_id is not None else 0
-    with _lock, _connect() as conn:
+    with _db() as conn:
         rows = conn.execute(
             f"""{_SUMMARY_SELECT}
                 WHERE d.id > ?
@@ -249,7 +298,7 @@ def add_design_tag(design_id: int, tag: str) -> dict:
     确认该设计下尚未有同名标签 → 写入并返回该设计的完整标签列表（按首次
     添加顺序）。设计不存在抛 DesignNotFoundError；标签非法抛 TagError；
     重复抛 DuplicateTagError，失败时事务整体回滚不写库。"""
-    with _lock, _connect() as conn:
+    with _db() as conn:
         design = conn.execute(
             "SELECT 1 FROM designs WHERE id = ?", (design_id,)
         ).fetchone()
@@ -282,7 +331,7 @@ def add_design_tag(design_id: int, tag: str) -> dict:
 def list_design_tags(design_id: int) -> dict:
     """按首次添加顺序返回设计的标签与数量；设计不存在抛
     DesignNotFoundError。只读，不改动原设计与审计结果。"""
-    with _lock, _connect() as conn:
+    with _db() as conn:
         design = conn.execute(
             "SELECT 1 FROM designs WHERE id = ?", (design_id,)
         ).fetchone()
@@ -297,24 +346,41 @@ def list_design_tags(design_id: int) -> dict:
 
 
 def get_designs_many(design_ids: list[int]) -> list[dict | None]:
-    """在同一连接 / 同一读取快照内按给定顺序返回设计详情（结构与
-    get_design 一致）；缺失的 ID 对应位置为 None。用于归档前一次性读取
-    全部设计参数与审计结果，避免半读状态。"""
+    """按给定顺序返回设计详情（结构与 get_design 一致）；缺失的 ID 对应
+    位置为 None。
+
+    所有设计行、各自审计行与「ID 是否缺失」的判定都在**同一个 SQLite 读取
+    快照**（一个显式只读事务，见 `_read_snapshot`）内完成：即便另一服务
+    实例或维护进程在批量读取期间提交了设计 / 审计修改或删除，本次调用返回
+    的也是某一时刻的自洽整体，绝不会把新旧版本拼成从未存在过的清单。
+    POST /design-archives 的归档创建与 GET .../verify 的校验都经此函数，
+    共用同一快照语义。
+    """
     if not design_ids:
         return []
-    with _lock, _connect() as conn:
+    with _read_snapshot() as conn:
+        placeholders = ",".join("?" for _ in design_ids)
+        design_rows = conn.execute(
+            f"SELECT * FROM designs WHERE id IN ({placeholders})",
+            design_ids,
+        ).fetchall()
+        designs_by_id = {row["id"]: row for row in design_rows}
+        audit_rows = conn.execute(
+            f"SELECT * FROM audits WHERE design_id IN ({placeholders})",
+            design_ids,
+        ).fetchall()
+        audits_by_design = {row["design_id"]: row for row in audit_rows}
         results: list[dict | None] = []
         for design_id in design_ids:
-            design = conn.execute(
-                "SELECT * FROM designs WHERE id = ?", (design_id,)
-            ).fetchone()
+            design = designs_by_id.get(design_id)
             if design is None:
                 results.append(None)
                 continue
-            audit = conn.execute(
-                "SELECT * FROM audits WHERE design_id = ?", (design_id,)
-            ).fetchone()
-            results.append(_row_to_detail(design, audit))
+            # 设计与审计在同一快照内读出：设计存在则其审计行必然存在
+            # （同事务写入、UNIQUE 外键约束）。
+            results.append(
+                _row_to_detail(design, audits_by_design[design_id])
+            )
         return results
 
 
@@ -344,7 +410,7 @@ def insert_archive_or_get(
     的归档。返回 (归档记录, reused)，reused=True 表示命中既有归档（幂等
     复用，未新增数据）。
     """
-    with _lock, _connect() as conn:
+    with _db() as conn:
         existing = conn.execute(
             "SELECT * FROM design_archives WHERE digest = ?", (digest,)
         ).fetchone()
@@ -377,7 +443,7 @@ def insert_archive_or_get(
 
 def get_archive(archive_id: int) -> dict | None:
     """按归档 ID 读取完整归档（含解析后的 manifest 与原始规范化文本）。"""
-    with _lock, _connect() as conn:
+    with _db() as conn:
         row = conn.execute(
             "SELECT * FROM design_archives WHERE id = ?", (archive_id,)
         ).fetchone()
