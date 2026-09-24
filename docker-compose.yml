@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      PORT: 8000
+      DATABASE_PATH: /data/weave.db
+    volumes:
+      - weave-data:/data
+    restart: unless-stopped
+
+volumes:
+  weave-data:
