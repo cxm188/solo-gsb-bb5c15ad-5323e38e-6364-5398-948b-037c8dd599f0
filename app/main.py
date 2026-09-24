@@ -625,9 +625,13 @@ def _archive_payload(record: dict, reused: bool) -> dict:
     tags=["design-archives"],
 )
 def create_design_archive(request: DesignArchiveIn, response: Response) -> dict:
-    """设计归档：接收 1～50 个已入库设计 ID，**按 ID 升序去重**后在同一读取
-    流程中取出每份设计的参数与审计结果，生成规范化（键字典序、无空白、UTF-8）
+    """设计归档：接收 1～50 个已入库设计 ID，**按 ID 升序去重**后取出每份
+    设计的参数与审计结果，生成规范化（键字典序、无空白、UTF-8）
     JSON 清单（`design-archive-v1`），并计算其 SHA-256 摘要持久化。
+
+    整批读取（全部设计、各自审计以及缺失 ID 判定）固定在**同一个 SQLite
+    读取快照**（一条只读事务）上：即使另一服务实例或维护进程在读取期间
+    提交了设计 / 审计修改，清单也绝不会拼出新旧混合、从未存在过的版本。
 
     - 列表含重复 ID 返回 **400**，不写库；存在未入库 ID 返回 **404**
       （detail 列出全部缺失 ID），不写库——校验、读取全部成功后才执行唯一
@@ -671,6 +675,10 @@ def create_design_archive(request: DesignArchiveIn, response: Response) -> dict:
 def verify_design_archive(archive_id: int) -> dict:
     """归档完整性校验：按归档时记录的设计 ID 列表重新读取**当前**的设计参数
     与审计结果，重建规范化清单并重算 SHA-256 摘要，与归档摘要比对。
+
+    重算所用的整批读取与归档创建共用同一语义：所有设计、审计及缺失 ID
+    判定固定在**同一个 SQLite 读取快照**（一条只读事务）上，因此报告本身
+    不会因读取期间的并发修改而混入新旧版本。
 
     - `consistent`：重算摘要与归档摘要一致且无缺失设计项时为 `true`；
     - `missing_design_ids`：归档后被删除（或当前不存在）的设计 ID（升序）；

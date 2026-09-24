@@ -81,11 +81,19 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """启动时建表（幂等）。"""
+    """启动时建表（幂等），并启用 WAL 日志模式。
+
+    WAL 下读事务与写事务互不阻塞：归档这类「整批固定到一个读取快照」的
+    只读事务不会挡住另一服务实例 / 维护进程的写提交，写提交也不会让本批
+    读取失败或混版，避免 rollback journal 下读 / 写争用可能出现的
+    `database is locked`。journal_mode 是数据库文件的持久属性，只需设置
+    一次（幂等）。
+    """
     directory = os.path.dirname(DB_PATH)
     if directory:
         os.makedirs(directory, exist_ok=True)
     with _lock, _connect() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(_SCHEMA)
 
 
@@ -297,12 +305,25 @@ def list_design_tags(design_id: int) -> dict:
 
 
 def get_designs_many(design_ids: list[int]) -> list[dict | None]:
-    """在同一连接 / 同一读取快照内按给定顺序返回设计详情（结构与
-    get_design 一致）；缺失的 ID 对应位置为 None。用于归档前一次性读取
-    全部设计参数与审计结果，避免半读状态。"""
+    """按给定顺序返回设计详情（结构与 get_design 一致）；缺失的 ID 对应
+    位置为 None。用于归档前一次性读取全部设计参数与审计结果。
+
+    **同一 SQLite 读取快照保证**：整批读取（每份设计的 designs / audits
+    行，以及缺失 ID 的判定）在**一条显式开启的只读事务**内完成。事务在
+    第一条 SELECT 时确定快照，事务内后续所有 SELECT 读到的都是该瞬间的
+    同一版本——即使另一服务实例或维护进程在读取过程中提交了设计 / 审计
+    的修改或删除，本批结果也绝不会出现「部分旧版本、部分新版本」的拼接
+    清单（WAL 模式下写提交照常进行但不影响本快照；rollback journal 下写
+    提交等待本读事务结束）。归档创建与归档校验共用本函数，因此两者的
+    批量读取语义一致。
+    """
     if not design_ids:
         return []
     with _lock, _connect() as conn:
+        # 显式开启事务：默认 deferred 模式下，首条 SELECT 即固定本事务的
+        # 读取快照，事务结束前其他连接的写提交不会反映进来。只读不修改
+        # 数据，with 块结束时提交（释放快照），异常时回滚。
+        conn.execute("BEGIN")
         results: list[dict | None] = []
         for design_id in design_ids:
             design = conn.execute(

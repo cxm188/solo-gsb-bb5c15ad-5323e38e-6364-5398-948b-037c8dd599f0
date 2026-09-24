@@ -340,6 +340,168 @@ def test_verify_detects_drift_first_diff_path():
               "verify is a pure read: repeated reports identical")
 
 
+def _design_audit_selects(info):
+    """从 spy 记录中筛出批量读取 designs / audits 的查询。"""
+    return [
+        e for e in info
+        if "FROM designs" in e[1] or "FROM audits" in e[1]
+    ]
+
+
+def test_batch_read_pinned_to_single_snapshot():
+    """并发快照保证（白盒）：get_designs_many 的所有 designs / audits
+    查询（含缺失 ID 判定）必须在同一个显式读取事务内执行——每条 SELECT
+    发生时该连接都处于事务中，且整批只使用同一个连接。
+
+    SQLite 的读取快照在事务首次读取时确定并保持到事务结束；若查询像旧
+    实现那样逐条自动提交（in_transaction 为 False），另一实例 / 维护进程
+    就能在两次查询之间提交修改，把新旧版本拼进同一批结果。
+    """
+    import threading as _threading
+
+    with TestClient(app) as client:
+        a = _create(client, TWILL)["id"]
+
+        seen = []  # (id(conn), sql, in_transaction)
+        lock = _threading.Lock()
+
+        class _SpiedConnection:
+            """代理真实连接：记录 designs/audits 查询发生时的事务状态。"""
+
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, parameters=()):
+                if (
+                    isinstance(sql, str)
+                    and ("FROM designs" in sql or "FROM audits" in sql)
+                ):
+                    with lock:
+                        seen.append(
+                            (id(self._real), sql, self._real.in_transaction)
+                        )
+                return self._real.execute(sql, parameters)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+            def __enter__(self):
+                self._real.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return self._real.__exit__(*exc)
+
+        orig_connect = db._connect
+
+        def spy_connect():
+            return _SpiedConnection(orig_connect())
+
+        db._connect = spy_connect
+        try:
+            rows = db.get_designs_many([a, 99999])
+        finally:
+            db._connect = orig_connect
+
+        check(rows[0] is not None and rows[1] is None,
+              "get_designs_many returns detail and None slot for missing id")
+        events = _design_audit_selects(seen)
+        check(len(events) >= 3,
+              f"batch read issues design+audit+missing selects, got {len(events)}")
+        check(all(in_tx for _, _, in_tx in events),
+              "every designs/audits SELECT in the batch runs inside a transaction"
+              " (single pinned read snapshot; no per-statement autocommit)")
+        check(len({conn_id for conn_id, _, _ in events}) == 1,
+              "all selects of the batch run on one connection / one snapshot")
+
+        # verify 端点共用同一快照语义：重算读取的全部 SELECT 也在一个事务内
+        created = client.post(
+            "/design-archives", json={"design_ids": [a]}
+        ).json()
+        seen.clear()
+        db._connect = spy_connect
+        try:
+            resp = client.get(f"/design-archives/{created['id']}/verify")
+        finally:
+            db._connect = orig_connect
+        check(resp.status_code == 200 and resp.json()["consistent"],
+              "verify still consistent under snapshot spy")
+        events = _design_audit_selects(seen)
+        check(events and all(in_tx for _, _, in_tx in events),
+              "verify batch re-read is also pinned to one read transaction")
+        check(len({conn_id for conn_id, _, _ in events}) == 1,
+              "verify batch re-read uses one connection / one snapshot")
+
+
+def test_concurrent_batch_read_never_mixes_versions():
+    """并发快照保证（黑盒压力）：一个**独立进程**（不共享本进程的任何锁，
+    与「另一服务实例 / 维护进程」等价）在批量读取期间持续用独立事务提交
+    「设计 + 审计」成对修改，get_designs_many 每次返回的每一项必须自洽——
+    审计 exceeds 与设计 max_float 始终来自同一版本，且整批结果按请求顺序、
+    无缺失（ID 从不删除）。
+
+    若读取逐条自动提交，设计与其审计可能分别落在更新前后两个版本，
+    不变量即被打破。
+    """
+    import subprocess
+    import sys
+    import time
+
+    with TestClient(app) as client:
+        ids = [_create(client, TWILL)["id"] for _ in range(3)]
+        ordered = sorted(ids)
+
+        # 独立子进程维护写者：BEGIN IMMEDIATE 整事务成对更新 designs/audits。
+        writer_code = (
+            "import sqlite3, sys, time\n"
+            "path, ids = sys.argv[1], [int(x) for x in sys.argv[2:]]\n"
+            "conn = sqlite3.connect(path, timeout=10)\n"
+            "version = 0\n"
+            "while True:\n"
+            "    version += 1\n"
+            "    new_float = 5 if version % 2 else 1\n"
+            "    new_exceeds = 0 if new_float == 5 else 1\n"
+            "    conn.execute('BEGIN IMMEDIATE')\n"
+            "    for design_id in ids:\n"
+            "        conn.execute('UPDATE designs SET max_float = ? WHERE id = ?',\n"
+            "                     (new_float, design_id))\n"
+            "        conn.execute('UPDATE audits SET exceeds = ? WHERE design_id = ?',\n"
+            "                     (new_exceeds, design_id))\n"
+            "    conn.commit()\n"
+            "    time.sleep(0)\n"
+        )
+        writer = subprocess.Popen(
+            [sys.executable, "-c", writer_code, _TMP_DB.name, *map(str, ids)]
+        )
+        try:
+            # 等写者先跑若干轮，保证读取期间确实有并发提交。
+            time.sleep(0.3)
+            check(writer.poll() is None, "maintenance writer process stays alive")
+            for _ in range(200):
+                rows = db.get_designs_many(ordered)
+                check([r["id"] for r in rows] == ordered,
+                      "snapshot batch preserves requested id order")
+                for row in rows:
+                    expected_exceeds = row["max_float"] == 1
+                    check(
+                        row["audit"]["exceeds"] == expected_exceeds,
+                        "design parameters and audit come from the same snapshot "
+                        "version (no new/old mixing under concurrent writes)",
+                    )
+                # 归档创建共用同一批量读取：只允许 200/201（读到的必然是
+                # 某个自洽版本），绝不允许因快照拼版导致的 5xx 半成品。
+                resp = client.post(
+                    "/design-archives", json={"design_ids": ordered}
+                )
+                check(resp.status_code in (200, 201),
+                      f"archive creation succeeds amid concurrent writes, "
+                      f"got {resp.status_code}")
+        finally:
+            writer.terminate()
+            writer.wait(10)
+        check(writer.returncode != 0, "maintenance writer terminated with request")
+
+
 def test_openapi_documents_archive_routes():
     schema = app.openapi()
     paths = schema["paths"]
@@ -366,6 +528,8 @@ if __name__ == "__main__":
     test_verify_fresh_archive_consistent()
     test_verify_detects_deleted_design()
     test_verify_detects_drift_first_diff_path()
+    test_batch_read_pinned_to_single_snapshot()
+    test_concurrent_batch_read_never_mixes_versions()
     test_openapi_documents_archive_routes()
     try:
         os.unlink(_TMP_DB.name)
